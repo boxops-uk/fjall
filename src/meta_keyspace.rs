@@ -53,7 +53,7 @@ pub struct MetaKeyspace {
     pub keyspaces: Arc<RwLock<Keyspaces>>,
 
     seqno_generator: SequenceNumberCounter,
-    visible_seqno: SequenceNumberCounter,
+    visible_seqno: lsm_tree::VisibleSeqno,
 }
 
 impl MetaKeyspace {
@@ -61,7 +61,7 @@ impl MetaKeyspace {
         inner: AnyTree,
         keyspaces: Arc<RwLock<Keyspaces>>,
         seqno_generator: SequenceNumberCounter,
-        visible_seqno: SequenceNumberCounter,
+        visible_seqno: lsm_tree::VisibleSeqno,
     ) -> Self {
         Self {
             inner,
@@ -156,6 +156,11 @@ impl MetaKeyspace {
 
         let seqno = self.seqno_generator.next();
 
+        // **The meta keyspace is a writer like any other.** It used to advance the
+        // watermark with a bare `fetch_max`, which is a way past every other writer's
+        // turn in the queue — including a batch part-way through applying its rows.
+        let pending = self.visible_seqno.begin(seqno);
+
         let mut ingestion = self.inner.ingestion()?;
         {
             // Remove all config KVs
@@ -182,7 +187,7 @@ impl MetaKeyspace {
         }
         ingestion.finish()?;
 
-        self.visible_seqno.fetch_max(seqno + 1);
+        pending.publish();
 
         lock.remove(name);
 

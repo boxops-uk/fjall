@@ -244,7 +244,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
-        self.supervisor.snapshot_tracker.begin(seqno);
+        let pending = self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer.write_clear(self.id, seqno)?;
 
@@ -262,7 +262,7 @@ impl Keyspace {
             self.is_poisoned.poison();
         })?;
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        pending.publish();
 
         drop(journal_writer);
 
@@ -927,7 +927,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
-        self.supervisor.snapshot_tracker.begin(seqno);
+        let pending = self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(self.id, &key, &value, lsm_tree::ValueType::Value, seqno)
@@ -946,7 +946,7 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.insert(key, value, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        pending.publish();
 
         drop(journal_writer);
 
@@ -1002,7 +1002,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
-        self.supervisor.snapshot_tracker.begin(seqno);
+        let pending = self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)
@@ -1021,7 +1021,7 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.remove(key, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        pending.publish();
 
         drop(journal_writer);
 
@@ -1089,7 +1089,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
-        self.supervisor.snapshot_tracker.begin(seqno);
+        let pending = self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(
@@ -1116,7 +1116,7 @@ impl Keyspace {
 
         let (item_size, memtable_size) = self.tree.remove(key, seqno);
 
-        self.supervisor.snapshot_tracker.publish(seqno);
+        pending.publish();
 
         drop(journal_writer);
 

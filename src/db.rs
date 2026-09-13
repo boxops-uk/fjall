@@ -590,7 +590,7 @@ impl Database {
         let journal_manager = JournalManager::new();
 
         let seqno = SequenceNumberCounter::default();
-        let visible_seqno = SequenceNumberCounter::default();
+        let visible_seqno = lsm_tree::VisibleSeqno::default();
 
         let keyspaces = Arc::new(RwLock::new(Keyspaces::with_capacity_and_hasher(
             10,
@@ -842,7 +842,7 @@ impl Database {
         fsync_directory(&config.path)?;
 
         let seqno = SequenceNumberCounter::default();
-        let visible_seqno = SequenceNumberCounter::default();
+        let visible_seqno = lsm_tree::VisibleSeqno::default();
 
         let keyspaces = Arc::new(RwLock::new(Keyspaces::with_capacity_and_hasher(
             10,

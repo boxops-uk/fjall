@@ -4,37 +4,12 @@
 
 use crate::{snapshot_nonce::SnapshotNonce, SeqNo};
 use dashmap::DashMap;
-use lsm_tree::SequenceNumberCounter;
-use std::collections::BTreeSet;
-use std::sync::{atomic::AtomicU64, Arc, Mutex, RwLock};
-
-/// Writes that have taken a sequence number but have not finished applying.
-///
-/// **Why this exists.** Visibility is one watermark — [`SnapshotTracker::publish`] is
-/// `fetch_max(seqno + 1)` — so a write may only advance it once every *lower* write has
-/// landed in its memtable. Today that holds for free, because every writer applies its
-/// batch while still holding the journal writer, and the journal writer is one mutex:
-/// completions cannot overtake one another because they are not concurrent.
-///
-/// Moving the memtable apply out of that mutex is the whole point of this change, and
-/// it takes the ordering with it. Without something in its place, a batch at seqno 6
-/// could publish while the batch at seqno 5 is still inserting, and a reader snapshotted
-/// at 7 would miss rows that a lower sequence number promises it can see.
-///
-/// So the ordering is stated explicitly rather than inherited from a lock: a writer
-/// registers its sequence number before it can be observed missing, and on finishing
-/// the watermark advances only as far as the lowest one still in flight allows.
-#[derive(Default)]
-struct InFlight {
-    /// Sequence numbers taken and not yet applied.
-    taken: BTreeSet<SeqNo>,
-    /// The highest that has finished, whether or not it is publishable yet.
-    done: SeqNo,
-}
+use lsm_tree::{Pending, VisibleSeqno};
+use std::sync::{atomic::AtomicU64, Arc, RwLock};
 
 /// Keeps track of open snapshots
 pub struct SnapshotTrackerInner {
-    seqno: SequenceNumberCounter,
+    seqno: VisibleSeqno,
 
     gc_lock: RwLock<()>,
 
@@ -43,9 +18,6 @@ pub struct SnapshotTrackerInner {
 
     freed_count: AtomicU64,
 
-    /// See [`InFlight`]. Held for a set insert or removal and nothing else — never
-    /// across the journal, the memtable, or any I/O.
-    in_flight: Mutex<InFlight>,
 
     pub(crate) lowest_freed_instant: AtomicU64,
 }
@@ -62,18 +34,17 @@ impl std::ops::Deref for SnapshotTracker {
 }
 
 impl SnapshotTracker {
-    pub fn new(seqno: SequenceNumberCounter) -> Self {
+    pub fn new(seqno: VisibleSeqno) -> Self {
         Self(Arc::new(SnapshotTrackerInner {
             data: DashMap::default(),
             freed_count: AtomicU64::default(),
-            in_flight: Mutex::default(),
             lowest_freed_instant: AtomicU64::default(),
             seqno,
             gc_lock: RwLock::default(),
         }))
     }
 
-    pub fn get_ref(&self) -> SequenceNumberCounter {
+    pub fn get_ref(&self) -> VisibleSeqno {
         self.seqno.clone()
     }
 
@@ -88,7 +59,7 @@ impl SnapshotTracker {
 
     /// Used in database recovery.
     pub fn set(&self, value: SeqNo) {
-        self.seqno.fetch_max(value);
+        self.seqno.restore(value);
     }
 
     pub fn len(&self) -> usize {
@@ -151,35 +122,15 @@ impl SnapshotTracker {
         }
     }
 
-    /// Register a sequence number as taken, before anything can observe it missing.
+    /// Take `seqno` out of circulation until the returned guard is finished.
     ///
-    /// Must be paired with [`SnapshotTracker::publish`], on the error paths too: a
-    /// sequence number that is taken and never finished holds the watermark still.
-    /// Finishing one that wrote nothing is harmless, since nothing exists at it.
-    pub fn begin(&self, seqno: SeqNo) {
-        #[expect(clippy::expect_used)]
-        let mut in_flight = self.in_flight.lock().expect("lock is poisoned");
-        in_flight.taken.insert(seqno);
-    }
-
-    /// Publish write completion, **no further than the lowest write still in flight**.
-    pub fn publish(&self, batch_seqno: SeqNo) {
-        #[expect(clippy::expect_used)]
-        let mut in_flight = self.in_flight.lock().expect("lock is poisoned");
-
-        in_flight.taken.remove(&batch_seqno);
-        in_flight.done = in_flight.done.max(batch_seqno);
-
-        // Everything below the lowest sequence number still being applied has landed,
-        // so that is how far a reader may see. With nothing in flight, everything has.
-        let visible = in_flight
-            .taken
-            .first()
-            .map_or(in_flight.done, |lowest| lowest.saturating_sub(1));
-
-        // `fetch_max` under the same lock that decides the bound, so two writers
-        // finishing at once cannot interleave into a watermark neither computed.
-        self.seqno.fetch_max(visible + 1);
+    /// **The rule lives on the counter, in `lsm_tree`, and not here.** It has to: a
+    /// version upgrade takes a sequence number too — memtable rotation, ingest,
+    /// compaction on its own thread — and a register this crate kept to itself would be
+    /// one those could walk past. This is the same gate they go through.
+    #[must_use = "the watermark cannot pass this sequence number until it is finished"]
+    pub fn begin(&self, seqno: SeqNo) -> Pending {
+        self.seqno.begin(seqno)
     }
 
     // TODO: after recovery, we may need to set the GC watermark once to current_seqno - 1
@@ -339,7 +290,7 @@ mod tests {
 
     #[test]
     fn snapshot_tracker_basic() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
 
         let map = SnapshotTracker::new(global_seqno.clone());
 
@@ -349,7 +300,7 @@ mod tests {
 
         assert_eq!(map.get_seqno_safe_to_gc(), 0);
 
-        let _ = global_seqno.next();
+        global_seqno.restore(global_seqno.get() + 1);
 
         let nonce = map.open();
         assert_eq!(1, nonce.instant);
@@ -358,13 +309,13 @@ mod tests {
 
     #[test]
     fn snapshot_tracker_increase_watermark() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
 
         let map = SnapshotTracker::new(global_seqno.clone());
 
         // Simulates some tx committing
         for _ in 0..100_000 {
-            let _ = global_seqno.next();
+            global_seqno.restore(global_seqno.get() + 1);
             let nonce = map.open();
             drop(nonce);
         }
@@ -374,7 +325,7 @@ mod tests {
 
     #[test]
     fn snapshot_tracker_prevent_watermark() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
 
         let map = SnapshotTracker::new(global_seqno.clone());
 
@@ -383,7 +334,7 @@ mod tests {
 
         // Simlates some inserts happening
         for _ in 0..1_000 {
-            let _ = global_seqno.next();
+            global_seqno.restore(global_seqno.get() + 1);
         }
 
         // Simulates more read tx opening and closing
@@ -397,7 +348,7 @@ mod tests {
 
     #[test]
     fn snapshot_tracker_close_never_opened_does_not_underflow_or_panic() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
         let map = SnapshotTracker::new(global_seqno);
 
         assert_eq!(map.len(), 0);
@@ -407,7 +358,7 @@ mod tests {
 
     #[test]
     fn snapshot_tracker_concurrent_open_same_seqno_counts_correctly() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
         let map = SnapshotTracker::new(global_seqno);
 
         // make sure seqno doesn't change between two opens
@@ -425,178 +376,23 @@ mod tests {
         assert_eq!(map.open_snapshots(), 0);
     }
 
-    // ---- the ordering invariant -------------------------------------------------
-    //
-    // `publish` is `fetch_max(visible + 1)` over a single watermark, so a write may only
-    // advance it once every *lower* write has landed. Before the memtable apply moved
-    // out of the journal writer, that held for free — writers could not overtake one
-    // another because they were not concurrent. These are what holds it now.
-
-    /// The tracker under test, plus the counter a reader would look at.
-    fn tracker() -> (SnapshotTracker, SequenceNumberCounter) {
-        let visible = SequenceNumberCounter::default();
-        (SnapshotTracker::new(visible.clone()), visible)
-    }
-
-    #[test]
-    fn a_lone_write_publishes_as_soon_as_it_finishes() {
-        let (map, visible) = tracker();
-
-        map.begin(5);
-        assert_eq!(0, visible.get(), "nothing is visible until something finishes");
-
-        map.publish(5);
-        assert_eq!(6, visible.get(), "5 has landed, so a reader may see it");
-    }
-
-    #[test]
-    fn a_write_still_applying_holds_the_watermark_below_itself() {
-        let (map, visible) = tracker();
-
-        // 5 takes its number and is still inserting rows; 6 takes its number after and
-        // finishes first. This is exactly the interleaving that releasing the journal
-        // writer early makes possible.
-        map.begin(5);
-        map.begin(6);
-        map.publish(6);
-
-        assert!(
-            visible.get() <= 5,
-            "6 published past 5, which is still applying: a reader at {} is promised \
-             rows that are not in a memtable yet",
-            visible.get()
-        );
-
-        map.publish(5);
-        assert_eq!(7, visible.get(), "with 5 landed, both are visible");
-    }
-
-    #[test]
-    fn finishing_out_of_order_never_exposes_a_gap() {
-        let (map, visible) = tracker();
-
-        for seqno in 5..=8 {
-            map.begin(seqno);
-        }
-
-        // Everything above the straggler finishes, in a deliberately awkward order.
-        for seqno in [7, 8, 6] {
-            map.publish(seqno);
-            assert!(
-                visible.get() <= 5,
-                "publishing {seqno} moved the watermark to {} while 5 is still applying",
-                visible.get()
-            );
-        }
-
-        map.publish(5);
-        assert_eq!(9, visible.get(), "the whole run becomes visible at once");
-    }
-
-    #[test]
-    fn the_watermark_only_ever_moves_forward() {
-        let (map, visible) = tracker();
-
-        map.begin(5);
-        map.publish(5);
-        assert_eq!(6, visible.get());
-
-        // A late straggler beneath the watermark must not drag a reader backwards; the
-        // rows are already there, and `fetch_max` is what makes this safe.
-        map.begin(3);
-        map.publish(3);
-        assert_eq!(6, visible.get(), "the watermark went backwards");
-    }
-
-    /// **Why every error path has to publish.**
-    ///
-    /// Not an aspiration but a characterisation: a sequence number taken and never
-    /// finished stops the watermark permanently, and the database silently stops making
-    /// new writes visible. This is the failure that makes the `publish` calls on
-    /// `commit`'s error paths load-bearing rather than tidy.
-    #[test]
-    fn a_number_taken_and_never_finished_stalls_everything_above_it() {
-        let (map, visible) = tracker();
-
-        map.begin(5);
-        for seqno in 6..=20 {
-            map.begin(seqno);
-            map.publish(seqno);
-        }
-
-        assert!(
-            visible.get() <= 5,
-            "fifteen finished writes are held by one that never did, as they must be"
-        );
-    }
-
-    /// **The invariant itself, over arbitrary interleavings.**
-    ///
-    /// A hand-written case can only cover the orderings somebody thought of. This walks
-    /// a deterministic pseudo-random schedule of begins and publishes and asserts the
-    /// one rule after every single step: *nothing at or above the lowest write still
-    /// applying is visible.*
-    #[test]
-    fn no_schedule_of_writers_exposes_a_write_that_has_not_landed() {
-        use std::collections::BTreeSet;
-
-        let (map, visible) = tracker();
-
-        let mut next = 1u64;
-        let mut outstanding: BTreeSet<u64> = BTreeSet::new();
-        let mut rng = 0x2545_F491_4F6C_DD1Du64;
-        let mut published = 0u64;
-
-        for _ in 0..20_000 {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-
-            // Take a new number, or finish one already outstanding.
-            if outstanding.is_empty() || rng % 3 != 0 {
-                map.begin(next);
-                outstanding.insert(next);
-                next += 1;
-            } else {
-                let at = (rng >> 8) as usize % outstanding.len();
-                #[expect(clippy::expect_used)]
-                let seqno = *outstanding.iter().nth(at).expect("in range");
-                outstanding.remove(&seqno);
-                map.publish(seqno);
-                published += 1;
-            }
-
-            // **The invariant.** A reader may see strictly below the lowest number still
-            // being applied; with nothing outstanding it may see everything finished.
-            if let Some(lowest) = outstanding.first() {
-                assert!(
-                    visible.get() <= *lowest,
-                    "watermark {} reaches {lowest}, which has not landed",
-                    visible.get()
-                );
-            }
-        }
-
-        assert!(published > 1_000, "the schedule barely finished anything: {published}");
-    }
-
     #[test]
     fn snapshot_tracker_publish_moves_seqno_forward_and_ignores_older() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
         let map = SnapshotTracker::new(global_seqno);
 
         let big = 100u64;
-        map.publish(big);
+        map.begin(big).publish();
         assert!(map.get() == (big + 1));
 
         let before = map.get();
-        map.publish(1);
+        map.begin(1).publish();
         assert_eq!(map.get(), before);
     }
 
     #[test]
     fn snapshot_tracker_clone_snapshot_behaves_like_second_open() {
-        let global_seqno = SequenceNumberCounter::default();
+        let global_seqno = VisibleSeqno::default();
         let map = SnapshotTracker::new(global_seqno);
 
         let orig = map.open();

@@ -99,7 +99,7 @@ fn keyspace_torn_read() -> fjall::Result<()> {
     // ...
 
     // Submitting batch completion
-    db.supervisor.snapshot_tracker.publish(batch_seqno);
+    db.supervisor.snapshot_tracker.begin(batch_seqno).publish();
 
     let snapshot = db.snapshot();
     assert_eq!(initial_seqno + 1, snapshot.seqno());

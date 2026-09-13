@@ -1,3 +1,7 @@
+//! Needs the pause seam, so the whole file is gated on it:
+//! `cargo test --features __internal_whitebox --test write_ordering`.
+#![cfg(feature = "__internal_whitebox")]
+
 //! **A write that has not landed is never visible.**
 //!
 //! `WriteBatch::commit` releases the journal writer before it applies its rows, so

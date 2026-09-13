@@ -112,16 +112,12 @@ impl WriteBatch {
 
         let batch_seqno = self.db.supervisor.seqno.next();
 
-        // Taken before anything can observe it missing — see `InFlight`. Every exit
-        // below this point has to reach `publish`, including the error paths, or the
-        // watermark stops here.
-        self.db.supervisor.snapshot_tracker.begin(batch_seqno);
+        // **Taken before anything can observe it missing.** Held as a guard rather than
+        // a matching `publish` call on every exit: a sequence number that leaks holds
+        // the watermark permanently, and there are three ways out of this function.
+        let pending = self.db.supervisor.snapshot_tracker.begin(batch_seqno);
 
-        if let Err(e) = journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)
-        {
-            self.db.supervisor.snapshot_tracker.publish(batch_seqno);
-            return Err(e);
-        }
+        journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)?;
 
         if let Some(mode) = self.durability {
             if let Err(e) = journal_writer.persist(mode) {
@@ -131,7 +127,6 @@ impl WriteBatch {
                     "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
                 );
 
-                self.db.supervisor.snapshot_tracker.publish(batch_seqno);
                 return Err(crate::Error::Poisoned);
             }
         }
@@ -187,7 +182,7 @@ impl WriteBatch {
             keyspaces_with_possible_stall.insert(item.keyspace.clone());
         }
 
-        self.db.supervisor.snapshot_tracker.publish(batch_seqno);
+        pending.publish();
 
         drop(keyspaces);
 
