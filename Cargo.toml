@@ -41,3 +41,8 @@ rand = "0.10.0"
 
 [package.metadata.cargo-all-features]
 denylist = ["__internal_whitebox"]
+
+# EXPERIMENT: this fork is developed against the lsm-tree fork beside it, so `cargo
+# test` here exercises the pair rather than fjall's changes against a stock engine.
+[patch.crates-io]
+lsm-tree = { path = "../lsm-tree" }
