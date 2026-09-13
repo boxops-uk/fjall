@@ -151,6 +151,11 @@ impl WriteBatch {
 
         log::trace!("batch: Freed journal writer");
 
+        // The window this whole ordering exists to cover: the sequence number is taken,
+        // the journal has it, and not one row is in a memtable yet.
+        #[cfg(feature = "__internal_whitebox")]
+        crate::write_hook::journal_released(batch_seqno);
+
         // TODO: maybe we can use a stack alloc hashset/vec here, such as smallset
         #[expect(clippy::mutable_key_type)]
         let mut keyspaces_with_possible_stall = HashSet::new();

@@ -425,6 +425,161 @@ mod tests {
         assert_eq!(map.open_snapshots(), 0);
     }
 
+    // ---- the ordering invariant -------------------------------------------------
+    //
+    // `publish` is `fetch_max(visible + 1)` over a single watermark, so a write may only
+    // advance it once every *lower* write has landed. Before the memtable apply moved
+    // out of the journal writer, that held for free — writers could not overtake one
+    // another because they were not concurrent. These are what holds it now.
+
+    /// The tracker under test, plus the counter a reader would look at.
+    fn tracker() -> (SnapshotTracker, SequenceNumberCounter) {
+        let visible = SequenceNumberCounter::default();
+        (SnapshotTracker::new(visible.clone()), visible)
+    }
+
+    #[test]
+    fn a_lone_write_publishes_as_soon_as_it_finishes() {
+        let (map, visible) = tracker();
+
+        map.begin(5);
+        assert_eq!(0, visible.get(), "nothing is visible until something finishes");
+
+        map.publish(5);
+        assert_eq!(6, visible.get(), "5 has landed, so a reader may see it");
+    }
+
+    #[test]
+    fn a_write_still_applying_holds_the_watermark_below_itself() {
+        let (map, visible) = tracker();
+
+        // 5 takes its number and is still inserting rows; 6 takes its number after and
+        // finishes first. This is exactly the interleaving that releasing the journal
+        // writer early makes possible.
+        map.begin(5);
+        map.begin(6);
+        map.publish(6);
+
+        assert!(
+            visible.get() <= 5,
+            "6 published past 5, which is still applying: a reader at {} is promised \
+             rows that are not in a memtable yet",
+            visible.get()
+        );
+
+        map.publish(5);
+        assert_eq!(7, visible.get(), "with 5 landed, both are visible");
+    }
+
+    #[test]
+    fn finishing_out_of_order_never_exposes_a_gap() {
+        let (map, visible) = tracker();
+
+        for seqno in 5..=8 {
+            map.begin(seqno);
+        }
+
+        // Everything above the straggler finishes, in a deliberately awkward order.
+        for seqno in [7, 8, 6] {
+            map.publish(seqno);
+            assert!(
+                visible.get() <= 5,
+                "publishing {seqno} moved the watermark to {} while 5 is still applying",
+                visible.get()
+            );
+        }
+
+        map.publish(5);
+        assert_eq!(9, visible.get(), "the whole run becomes visible at once");
+    }
+
+    #[test]
+    fn the_watermark_only_ever_moves_forward() {
+        let (map, visible) = tracker();
+
+        map.begin(5);
+        map.publish(5);
+        assert_eq!(6, visible.get());
+
+        // A late straggler beneath the watermark must not drag a reader backwards; the
+        // rows are already there, and `fetch_max` is what makes this safe.
+        map.begin(3);
+        map.publish(3);
+        assert_eq!(6, visible.get(), "the watermark went backwards");
+    }
+
+    /// **Why every error path has to publish.**
+    ///
+    /// Not an aspiration but a characterisation: a sequence number taken and never
+    /// finished stops the watermark permanently, and the database silently stops making
+    /// new writes visible. This is the failure that makes the `publish` calls on
+    /// `commit`'s error paths load-bearing rather than tidy.
+    #[test]
+    fn a_number_taken_and_never_finished_stalls_everything_above_it() {
+        let (map, visible) = tracker();
+
+        map.begin(5);
+        for seqno in 6..=20 {
+            map.begin(seqno);
+            map.publish(seqno);
+        }
+
+        assert!(
+            visible.get() <= 5,
+            "fifteen finished writes are held by one that never did, as they must be"
+        );
+    }
+
+    /// **The invariant itself, over arbitrary interleavings.**
+    ///
+    /// A hand-written case can only cover the orderings somebody thought of. This walks
+    /// a deterministic pseudo-random schedule of begins and publishes and asserts the
+    /// one rule after every single step: *nothing at or above the lowest write still
+    /// applying is visible.*
+    #[test]
+    fn no_schedule_of_writers_exposes_a_write_that_has_not_landed() {
+        use std::collections::BTreeSet;
+
+        let (map, visible) = tracker();
+
+        let mut next = 1u64;
+        let mut outstanding: BTreeSet<u64> = BTreeSet::new();
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut published = 0u64;
+
+        for _ in 0..20_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+
+            // Take a new number, or finish one already outstanding.
+            if outstanding.is_empty() || rng % 3 != 0 {
+                map.begin(next);
+                outstanding.insert(next);
+                next += 1;
+            } else {
+                let at = (rng >> 8) as usize % outstanding.len();
+                #[expect(clippy::expect_used)]
+                let seqno = *outstanding.iter().nth(at).expect("in range");
+                outstanding.remove(&seqno);
+                map.publish(seqno);
+                published += 1;
+            }
+
+            // **The invariant.** A reader may see strictly below the lowest number still
+            // being applied; with nothing outstanding it may see everything finished.
+            if let Some(lowest) = outstanding.first() {
+                assert!(
+                    visible.get() <= *lowest,
+                    "watermark {} reaches {lowest}, which has not landed",
+                    visible.get()
+                );
+            }
+        }
+
+        assert!(published > 1_000, "the schedule barely finished anything: {published}");
+    }
+
     #[test]
     fn snapshot_tracker_publish_moves_seqno_forward_and_ignores_older() {
         let global_seqno = SequenceNumberCounter::default();

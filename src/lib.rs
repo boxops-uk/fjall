@@ -102,6 +102,10 @@ mod db_config;
 #[doc(hidden)]
 pub mod drop;
 
+#[cfg(feature = "__internal_whitebox")]
+#[doc(hidden)]
+pub mod write_hook;
+
 mod db;
 
 #[cfg(test)]
