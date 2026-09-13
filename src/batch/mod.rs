@@ -112,7 +112,16 @@ impl WriteBatch {
 
         let batch_seqno = self.db.supervisor.seqno.next();
 
-        journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)?;
+        // Taken before anything can observe it missing — see `InFlight`. Every exit
+        // below this point has to reach `publish`, including the error paths, or the
+        // watermark stops here.
+        self.db.supervisor.snapshot_tracker.begin(batch_seqno);
+
+        if let Err(e) = journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)
+        {
+            self.db.supervisor.snapshot_tracker.publish(batch_seqno);
+            return Err(e);
+        }
 
         if let Some(mode) = self.durability {
             if let Err(e) = journal_writer.persist(mode) {
@@ -122,9 +131,25 @@ impl WriteBatch {
                     "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
                 );
 
+                self.db.supervisor.snapshot_tracker.publish(batch_seqno);
                 return Err(crate::Error::Poisoned);
             }
         }
+
+        // **The journal is written; the memtables are not this lock's business.**
+        //
+        // The append has to be serialised — it is a log, and its order is the recovery
+        // order. Inserting into each keyspace's memtable does not: a memtable takes its
+        // own lock, the sequence number that orders these rows against every other
+        // writer's is already assigned, and `InFlight` is what keeps a later batch from
+        // making itself visible before an earlier one has landed.
+        //
+        // Holding it anyway made the memtable apply — which is proportional to the rows
+        // in the batch, not to its bytes — a globally serial region, and measurably the
+        // reason write throughput stops scaling at four writers.
+        drop(journal_writer);
+
+        log::trace!("batch: Freed journal writer");
 
         // TODO: maybe we can use a stack alloc hashset/vec here, such as smallset
         #[expect(clippy::mutable_key_type)]
@@ -158,10 +183,6 @@ impl WriteBatch {
         }
 
         self.db.supervisor.snapshot_tracker.publish(batch_seqno);
-
-        drop(journal_writer);
-
-        log::trace!("batch: Freed journal writer");
 
         drop(keyspaces);
 

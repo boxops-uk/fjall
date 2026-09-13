@@ -5,7 +5,32 @@
 use crate::{snapshot_nonce::SnapshotNonce, SeqNo};
 use dashmap::DashMap;
 use lsm_tree::SequenceNumberCounter;
-use std::sync::{atomic::AtomicU64, Arc, RwLock};
+use std::collections::BTreeSet;
+use std::sync::{atomic::AtomicU64, Arc, Mutex, RwLock};
+
+/// Writes that have taken a sequence number but have not finished applying.
+///
+/// **Why this exists.** Visibility is one watermark — [`SnapshotTracker::publish`] is
+/// `fetch_max(seqno + 1)` — so a write may only advance it once every *lower* write has
+/// landed in its memtable. Today that holds for free, because every writer applies its
+/// batch while still holding the journal writer, and the journal writer is one mutex:
+/// completions cannot overtake one another because they are not concurrent.
+///
+/// Moving the memtable apply out of that mutex is the whole point of this change, and
+/// it takes the ordering with it. Without something in its place, a batch at seqno 6
+/// could publish while the batch at seqno 5 is still inserting, and a reader snapshotted
+/// at 7 would miss rows that a lower sequence number promises it can see.
+///
+/// So the ordering is stated explicitly rather than inherited from a lock: a writer
+/// registers its sequence number before it can be observed missing, and on finishing
+/// the watermark advances only as far as the lowest one still in flight allows.
+#[derive(Default)]
+struct InFlight {
+    /// Sequence numbers taken and not yet applied.
+    taken: BTreeSet<SeqNo>,
+    /// The highest that has finished, whether or not it is publishable yet.
+    done: SeqNo,
+}
 
 /// Keeps track of open snapshots
 pub struct SnapshotTrackerInner {
@@ -17,6 +42,10 @@ pub struct SnapshotTrackerInner {
     data: DashMap<SeqNo, usize, xxhash_rust::xxh3::Xxh3Builder>,
 
     freed_count: AtomicU64,
+
+    /// See [`InFlight`]. Held for a set insert or removal and nothing else — never
+    /// across the journal, the memtable, or any I/O.
+    in_flight: Mutex<InFlight>,
 
     pub(crate) lowest_freed_instant: AtomicU64,
 }
@@ -37,6 +66,7 @@ impl SnapshotTracker {
         Self(Arc::new(SnapshotTrackerInner {
             data: DashMap::default(),
             freed_count: AtomicU64::default(),
+            in_flight: Mutex::default(),
             lowest_freed_instant: AtomicU64::default(),
             seqno,
             gc_lock: RwLock::default(),
@@ -121,9 +151,35 @@ impl SnapshotTracker {
         }
     }
 
-    /// Publish write completion
+    /// Register a sequence number as taken, before anything can observe it missing.
+    ///
+    /// Must be paired with [`SnapshotTracker::publish`], on the error paths too: a
+    /// sequence number that is taken and never finished holds the watermark still.
+    /// Finishing one that wrote nothing is harmless, since nothing exists at it.
+    pub fn begin(&self, seqno: SeqNo) {
+        #[expect(clippy::expect_used)]
+        let mut in_flight = self.in_flight.lock().expect("lock is poisoned");
+        in_flight.taken.insert(seqno);
+    }
+
+    /// Publish write completion, **no further than the lowest write still in flight**.
     pub fn publish(&self, batch_seqno: SeqNo) {
-        self.seqno.fetch_max(batch_seqno + 1);
+        #[expect(clippy::expect_used)]
+        let mut in_flight = self.in_flight.lock().expect("lock is poisoned");
+
+        in_flight.taken.remove(&batch_seqno);
+        in_flight.done = in_flight.done.max(batch_seqno);
+
+        // Everything below the lowest sequence number still being applied has landed,
+        // so that is how far a reader may see. With nothing in flight, everything has.
+        let visible = in_flight
+            .taken
+            .first()
+            .map_or(in_flight.done, |lowest| lowest.saturating_sub(1));
+
+        // `fetch_max` under the same lock that decides the bound, so two writers
+        // finishing at once cannot interleave into a watermark neither computed.
+        self.seqno.fetch_max(visible + 1);
     }
 
     // TODO: after recovery, we may need to set the GC watermark once to current_seqno - 1

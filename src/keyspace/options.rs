@@ -58,6 +58,11 @@ pub struct CreateOptions {
     #[doc(hidden)]
     pub expect_point_read_hits: bool,
 
+    /// If `true`, the active memtable carries a Bloom filter too — see
+    /// [`CreateOptions::memtable_filter`].
+    #[doc(hidden)]
+    pub memtable_filter: bool,
+
     /// Filter construction policy.
     #[doc(hidden)]
     pub filter_policy: FilterPolicy,
@@ -104,6 +109,7 @@ impl Default for CreateOptions {
             filter_block_partitioning_policy: PartitioningPolicy::new([false, false, false, true]),
 
             expect_point_read_hits: false,
+            memtable_filter: false,
 
             filter_policy: FilterPolicy::new([
                 FilterPolicyEntry::Bloom(BloomConstructionPolicy::FalsePositiveRate(0.0001)),
@@ -361,6 +367,7 @@ impl CreateOptions {
 
             expect_point_read_hits,
             filter_policy,
+            memtable_filter: false,
 
             level_count: 7, // Levels are currently hard coded to 7
 
@@ -519,6 +526,23 @@ impl CreateOptions {
         }
 
         kvs
+    }
+
+    /// Toggles key-value separation.
+    #[must_use]
+    /// Build a Bloom filter over the active memtable as well as over sealed tables.
+    ///
+    /// **Off by default.** It is paid on every insert and collected on point reads
+    /// that *miss* — a read for a key that is present descends the memtable's skiplist
+    /// regardless, so a keyspace whose reads mostly hit is strictly worse off. Turn it
+    /// on for one that is asked about keys that usually are not there.
+    ///
+    /// Runtime only: it is not written to the keyspace's stored configuration, so it
+    /// must be passed on every open.
+    #[must_use]
+    pub fn memtable_filter(mut self, b: bool) -> Self {
+        self.memtable_filter = b;
+        self
     }
 
     /// Toggles key-value separation.

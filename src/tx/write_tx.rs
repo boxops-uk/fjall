@@ -266,7 +266,7 @@ impl BaseTransaction {
     ) {
         self.memtables
             .entry(keyspace.clone())
-            .or_insert_with(|| Arc::new(Memtable::new(0)))
+            .or_insert_with(|| Arc::new(Memtable::new(0, false)))
             .insert(lsm_tree::InternalValue::from_components(
                 key,
                 value,
@@ -284,7 +284,7 @@ impl BaseTransaction {
     pub(super) fn remove<K: Into<UserKey>>(&mut self, keyspace: &Keyspace, key: K) {
         self.memtables
             .entry(keyspace.clone())
-            .or_insert_with(|| Arc::new(Memtable::new(0)))
+            .or_insert_with(|| Arc::new(Memtable::new(0, false)))
             .insert(lsm_tree::InternalValue::new_tombstone(key, self.seqno));
 
         self.seqno += 1;
@@ -302,7 +302,7 @@ impl BaseTransaction {
     pub(super) fn remove_weak<K: Into<UserKey>>(&mut self, keyspace: &Keyspace, key: K) {
         self.memtables
             .entry(keyspace.clone())
-            .or_insert_with(|| Arc::new(Memtable::new(0)))
+            .or_insert_with(|| Arc::new(Memtable::new(0, false)))
             .insert(lsm_tree::InternalValue::new_weak_tombstone(key, self.seqno));
 
         self.seqno += 1;

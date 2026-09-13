@@ -51,6 +51,7 @@ pub fn apply_to_base_config(
         .index_block_pinning_policy(our_config.index_block_pinning_policy.clone())
         .data_block_hash_ratio_policy(our_config.data_block_hash_ratio_policy.clone())
         .expect_point_read_hits(our_config.expect_point_read_hits)
+        .memtable_filter(our_config.memtable_filter)
         .with_kv_separation(our_config.kv_separation_opts.clone())
         .index_block_partitioning_policy(our_config.index_block_partitioning_policy.clone())
         .filter_block_partitioning_policy(our_config.filter_block_partitioning_policy.clone())
@@ -243,6 +244,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
+        self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer.write_clear(self.id, seqno)?;
 
@@ -925,6 +927,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
+        self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(self.id, &key, &value, lsm_tree::ValueType::Value, seqno)
@@ -999,6 +1002,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
+        self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)
@@ -1085,6 +1089,7 @@ impl Keyspace {
         }
 
         let seqno = self.supervisor.seqno.next();
+        self.supervisor.snapshot_tracker.begin(seqno);
 
         journal_writer
             .write_raw(
