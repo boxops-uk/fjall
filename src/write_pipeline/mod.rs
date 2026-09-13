@@ -77,8 +77,44 @@ const MAX_GROUP: usize = 64;
 /// The most bytes one leader will journal in a group, for the same reason.
 const MAX_GROUP_BYTES: usize = 1_024 * 1_024;
 
-/// How long a member spins for its leader before yielding its core.
+/// How long a waiter spins before yielding its core.
+///
+/// A guess, and worth deriving rather than picking: the right value tracks how long a
+/// group's journal write takes, which scales with its bytes.
 const SPINS_BEFORE_YIELD: u32 = 256;
+
+/// **Wait without taking a core away from whoever you are waiting for.**
+///
+/// Both waits here are for another thread that needs CPU to do the thing being waited
+/// on — a leader journalling, or a leader draining the queue — and there are as many
+/// waiters as writers. Spinning is right for the first few microseconds and ruinous
+/// after that: measured at 24% on a hundred-row commit, where the wait is long relative
+/// to the work.
+///
+/// Yields rather than parks, because parking needs the other side to wake us: that is
+/// a `Thread` handle per record and an unpark on the leader's critical path, to save a
+/// wait that is usually shorter than the syscall pair it would cost. Spin, then yield,
+/// then re-read a flag that is already there.
+struct Backoff(u32);
+
+impl Backoff {
+    fn new() -> Self {
+        Self(0)
+    }
+
+    fn wait(&mut self) {
+        if self.0 < SPINS_BEFORE_YIELD {
+            self.0 += 1;
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.0 = 0;
+    }
+}
 
 /// What a writer is asking the pipeline to do.
 pub(crate) enum Work {
@@ -183,28 +219,44 @@ impl Pipeline {
         poisoned: &crate::poison::PoisonSignal,
         record: &Arc<Record>,
     ) -> crate::Result<()> {
-        let mut leading = {
-            #[expect(clippy::expect_used)]
-            let _queueing = self.handover.read().expect("lock is poisoned");
+        let mut backoff = Backoff::new();
 
-            while self.queue.try_push(record.clone()).is_none() {
-                std::hint::spin_loop();
+        // **The queue lock is dropped between attempts, and that is not tidiness.**
+        //
+        // `handover` is held for reading across the push and the lease attempt so a
+        // writer cannot enqueue into a group that has just been closed and then wait for
+        // a leader nobody will become. But the ring is bounded, and retrying inside the
+        // guard deadlocks outright once it fills: the waiters hold read locks,
+        // `hand_over` wants the write lock to promote the next leader, and the queue
+        // only drains once a leader exists. Nothing in that cycle can move.
+        //
+        // Releasing between attempts is what breaks it. A full queue is a non-empty
+        // queue, so `hand_over` always has a head to promote, and the leader it promotes
+        // frees `MAX_GROUP` slots.
+        let mut leading = loop {
+            #[expect(clippy::expect_used)]
+            let queueing = self.handover.read().expect("lock is poisoned");
+
+            if self.queue.try_push(record.clone()).is_some() {
+                // Exactly one writer wins this, and it owes the queue a group.
+                break self
+                    .lease
+                    .compare_exchange(true, false, AcqRel, Relaxed)
+                    .is_ok();
             }
 
-            // Exactly one writer wins this, and it owes the queue a group.
-            self.lease
-                .compare_exchange(true, false, AcqRel, Relaxed)
-                .is_ok()
+            drop(queueing);
+            backoff.wait();
         };
 
-        let mut waited = 0u32;
+        backoff.reset();
 
         loop {
             if leading {
                 let led = self.lead(supervisor, poisoned);
                 self.hand_over();
                 leading = false;
-                waited = 0;
+                backoff.reset();
                 led?;
             }
 
@@ -212,21 +264,8 @@ impl Pipeline {
                 JOURNALED => break,
                 TAKE_LEASE => leading = true,
                 FAILED => return Err(crate::Error::Poisoned),
-                _ => {
-                    // **Spin briefly, then get out of the way.** The wait is usually a
-                    // few microseconds, so parking outright would cost more than it
-                    // saves — but a member that spins hot is a core the leader and the
-                    // other members are not using to journal and fill memtables, and
-                    // there are as many spinners as writers. Measured: unbounded
-                    // spinning cost 24% at a hundred rows a commit, where the group is
-                    // small enough that the wait is long relative to the work.
-                    if waited < SPINS_BEFORE_YIELD {
-                        waited += 1;
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
-                }
+                // Waiting on the leader, which needs a core to journal with.
+                _ => backoff.wait(),
             }
         }
 

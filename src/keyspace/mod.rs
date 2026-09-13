@@ -981,41 +981,26 @@ impl Keyspace {
 
         let key = key.into();
 
-        let mut journal_writer = self.supervisor.journal.get_writer()?;
+        // Journalled with everything else queued, under one acquisition and one
+        // persist; this thread then applies its own tombstone. A single write is almost
+        // all fixed cost, which is the case group commit exists for.
+        let record = std::sync::Arc::new(crate::write_pipeline::Record::new(
+            crate::write_pipeline::Work::Single(crate::batch::item::Item {
+                keyspace: self.clone(),
+                key,
+                value: lsm_tree::UserValue::empty(),
+                value_type: lsm_tree::ValueType::Tombstone,
+            }),
+            if self.config.manual_journal_persist {
+                None
+            } else {
+                Some(crate::PersistMode::Buffer)
+            },
+        ));
 
-        // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.is_poisoned() {
-            return Err(crate::Error::Poisoned);
-        }
-
-        let seqno = self.supervisor.seqno.next();
-        let pending = self.supervisor.snapshot_tracker.begin(seqno);
-
-        journal_writer
-            .write_raw(self.id, &key, &[], lsm_tree::ValueType::Tombstone, seqno)
-            .inspect_err(|_| {
-                self.is_poisoned.poison();
-            })?;
-
-        if !self.config.manual_journal_persist {
-            journal_writer
-                .persist(crate::PersistMode::Buffer)
-                .inspect_err(|e| {
-                    log::error!("persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}");
-                    self.is_poisoned.poison();
-                })?;
-        }
-
-        let (item_size, memtable_size) = self.tree.remove(key, seqno);
-
-        pending.publish();
-
-        drop(journal_writer);
-
-        self.supervisor.write_buffer_size.allocate(item_size);
-        self.maintenance(memtable_size);
-
-        Ok(())
+        self.supervisor
+            .pipeline
+            .submit(&self.supervisor, &self.is_poisoned, &record)
     }
 
     /// Removes an item from the keyspace, leaving behind a weak tombstone.
@@ -1068,48 +1053,25 @@ impl Keyspace {
 
         let key = key.into();
 
-        let mut journal_writer = self.supervisor.journal.get_writer()?;
+        // Journalled with everything else queued, under one acquisition and one
+        // persist; this thread then applies its own tombstone. A single write is almost
+        // all fixed cost, which is the case group commit exists for.
+        let record = std::sync::Arc::new(crate::write_pipeline::Record::new(
+            crate::write_pipeline::Work::Single(crate::batch::item::Item {
+                keyspace: self.clone(),
+                key,
+                value: lsm_tree::UserValue::empty(),
+                value_type: lsm_tree::ValueType::WeakTombstone,
+            }),
+            if self.config.manual_journal_persist {
+                None
+            } else {
+                Some(crate::PersistMode::Buffer)
+            },
+        ));
 
-        // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.is_poisoned.is_poisoned() {
-            return Err(crate::Error::Poisoned);
-        }
-
-        let seqno = self.supervisor.seqno.next();
-        let pending = self.supervisor.snapshot_tracker.begin(seqno);
-
-        journal_writer
-            .write_raw(
-                self.id,
-                &key,
-                &[],
-                lsm_tree::ValueType::WeakTombstone,
-                seqno,
-            )
-            .inspect_err(|_| {
-                self.is_poisoned.poison();
-            })?;
-
-        if !self.config.manual_journal_persist {
-            journal_writer
-                .persist(crate::PersistMode::Buffer)
-                .inspect_err(|e| {
-                    log::error!(
-                        "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
-                    );
-                    self.is_poisoned.poison();
-                })?;
-        }
-
-        let (item_size, memtable_size) = self.tree.remove(key, seqno);
-
-        pending.publish();
-
-        drop(journal_writer);
-
-        self.supervisor.write_buffer_size.allocate(item_size);
-        self.maintenance(memtable_size);
-
-        Ok(())
+        self.supervisor
+            .pipeline
+            .submit(&self.supervisor, &self.is_poisoned, &record)
     }
 }
