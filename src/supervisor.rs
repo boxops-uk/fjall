@@ -29,6 +29,10 @@ pub struct SupervisorInner {
 
     pub(crate) journal: Arc<Journal>,
 
+    /// Group commit: one leader journals for everyone queued, then each member fills
+    /// its own memtables. See [`crate::write_pipeline`].
+    pub(crate) pipeline: crate::write_pipeline::Pipeline,
+
     /// Tracks journal size and garbage collects sealed journals when possible
     pub(crate) journal_manager: Arc<RwLock<JournalManager>>,
 

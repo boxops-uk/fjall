@@ -133,6 +133,14 @@ impl SnapshotTracker {
         self.seqno.begin(seqno)
     }
 
+    /// Take a whole contiguous run out of circulation — see
+    /// [`VisibleSeqno::begin_range`]. One entry for a group commit, rather than one per
+    /// write in it.
+    #[must_use = "the watermark cannot pass this run until it is finished"]
+    pub fn begin_range(&self, base: SeqNo, count: u64) -> Pending {
+        self.seqno.begin_range(base, count)
+    }
+
     // TODO: after recovery, we may need to set the GC watermark once to current_seqno - 1
     // so there cannot be compactions scheduled immediately with gc_watermark=0
     pub fn get_seqno_safe_to_gc(&self) -> SeqNo {

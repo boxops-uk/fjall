@@ -128,6 +128,7 @@ mod recovery;
 mod snapshot;
 mod snapshot_nonce;
 mod snapshot_tracker;
+mod write_pipeline;
 mod stats;
 mod supervisor;
 mod tx;

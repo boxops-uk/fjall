@@ -102,101 +102,19 @@ impl WriteBatch {
             return Ok(());
         }
 
-        log::trace!("batch: Acquiring journal writer");
-        let mut journal_writer = self.db.supervisor.journal.get_writer()?;
+        // **The journal is written by whichever writer is leading, not necessarily this
+        // one.** Batches from several threads are logged under one acquisition of the
+        // journal writer and one `persist`, which is what makes a small commit cheap;
+        // this thread then fills its own memtables, concurrently with the rest of the
+        // group. See [`crate::write_pipeline`] for why the leader stops where it does.
+        let record = std::sync::Arc::new(crate::write_pipeline::Record::new(
+            crate::write_pipeline::Work::Batch(std::mem::take(&mut self.data)),
+            self.durability,
+        ));
 
-        // IMPORTANT: Check the poisoned flag after getting journal mutex, otherwise TOCTOU
-        if self.db.is_poisoned.is_poisoned() {
-            return Err(crate::Error::Poisoned);
-        }
-
-        let batch_seqno = self.db.supervisor.seqno.next();
-
-        // **Taken before anything can observe it missing.** Held as a guard rather than
-        // a matching `publish` call on every exit: a sequence number that leaks holds
-        // the watermark permanently, and there are three ways out of this function.
-        let pending = self.db.supervisor.snapshot_tracker.begin(batch_seqno);
-
-        journal_writer.write_batch(self.data.iter(), self.data.len(), batch_seqno)?;
-
-        if let Some(mode) = self.durability {
-            if let Err(e) = journal_writer.persist(mode) {
-                self.db.is_poisoned.poison();
-
-                log::error!(
-                    "persist failed, which is a FATAL, and possibly hardware-related, failure: {e:?}"
-                );
-
-                return Err(crate::Error::Poisoned);
-            }
-        }
-
-        // **The journal is written; the memtables are not this lock's business.**
-        //
-        // The append has to be serialised — it is a log, and its order is the recovery
-        // order. Inserting into each keyspace's memtable does not: a memtable takes its
-        // own lock, the sequence number that orders these rows against every other
-        // writer's is already assigned, and `InFlight` is what keeps a later batch from
-        // making itself visible before an earlier one has landed.
-        //
-        // Holding it anyway made the memtable apply — which is proportional to the rows
-        // in the batch, not to its bytes — a globally serial region, and measurably the
-        // reason write throughput stops scaling at four writers.
-        drop(journal_writer);
-
-        log::trace!("batch: Freed journal writer");
-
-        // The window this whole ordering exists to cover: the sequence number is taken,
-        // the journal has it, and not one row is in a memtable yet.
-        #[cfg(feature = "__internal_whitebox")]
-        crate::write_hook::journal_released(batch_seqno);
-
-        // TODO: maybe we can use a stack alloc hashset/vec here, such as smallset
-        #[expect(clippy::mutable_key_type)]
-        let mut keyspaces_with_possible_stall = HashSet::new();
-
-        #[expect(clippy::expect_used)]
-        let keyspaces = self
-            .db
+        self.db
             .supervisor
-            .keyspaces
-            .read()
-            .expect("lock is poisoned");
-
-        let mut batch_size = 0u64;
-
-        log::trace!("Applying batch (size={}) to memtable(s)", self.data.len());
-
-        for item in std::mem::take(&mut self.data) {
-            // TODO: need a better, generic write op
-            let (item_size, _) = match item.value_type {
-                ValueType::Value => item.keyspace.tree.insert(item.key, item.value, batch_seqno),
-                ValueType::Tombstone => item.keyspace.tree.remove(item.key, batch_seqno),
-                ValueType::WeakTombstone => item.keyspace.tree.remove_weak(item.key, batch_seqno),
-                ValueType::Indirection => unreachable!(),
-            };
-
-            batch_size += item_size;
-
-            // IMPORTANT: Clone the handle, because we don't want to keep the keyspaces lock open
-            keyspaces_with_possible_stall.insert(item.keyspace.clone());
-        }
-
-        pending.publish();
-
-        drop(keyspaces);
-
-        // IMPORTANT: Add batch size to current write buffer size
-        // Otherwise write buffer growth is unbounded when using batches
-        self.db.supervisor.write_buffer_size.allocate(batch_size);
-
-        // Check each affected keyspace for write stall/halt
-        for keyspace in &keyspaces_with_possible_stall {
-            let memtable_size = keyspace.tree.active_memtable().size();
-            keyspace.check_memtable_rotate(memtable_size);
-            keyspace.local_backpressure();
-        }
-
-        Ok(())
+            .pipeline
+            .submit(&self.db.supervisor, &self.db.is_poisoned, &record)
     }
 }
