@@ -59,7 +59,8 @@ pub struct CreateOptions {
     pub expect_point_read_hits: bool,
 
     /// If `true`, the active memtable carries a Bloom filter too — see
-    /// [`CreateOptions::memtable_filter`].
+    /// [`CreateOptions::memtable_filter`]. Sized from `max_memtable_size`, which is this
+    /// crate's threshold and not something `lsm-tree` can see.
     #[doc(hidden)]
     pub memtable_filter: bool,
 

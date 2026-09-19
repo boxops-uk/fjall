@@ -44,6 +44,21 @@
 //! is contiguous and the bookkeeping is a single entry per *group* rather than one per
 //! write — which is the cheapest form the ordering rule takes anywhere.
 //!
+//! # What stays off it, and why that is not a gap
+//!
+//! `Keyspace::clear` and `rotate_memtable` take the journal writer directly.
+//!
+//! This pipeline amortises a fixed *per-commit* cost across many small row writes, and
+//! neither is that. `clear` is one whole-tree operation — there is no group of them to
+//! spread `F` over — and it already takes a sequence number and holds a `Pending`, so it
+//! is inside the ordering rule where it needs to be. `rotate_memtable` takes no sequence
+//! number at all: it moves the active memtable to sealed and publishes nothing, so there
+//! is nothing for a reader to see early.
+//!
+//! Both hold the journal writer for their duration, which blocks a leader forming a
+//! group. That is correct rather than unfortunate: a `clear` has to be ordered against
+//! the writes around it, and the way to order it is to make them wait.
+//!
 //! [flat combining]: https://people.csail.mit.edu/shanir/publications/Flat%20Combining%20SPAA%2010.pdf
 
 // The lockless ring buffer is the one place in this crate that needs raw memory

@@ -51,7 +51,14 @@ pub fn apply_to_base_config(
         .index_block_pinning_policy(our_config.index_block_pinning_policy.clone())
         .data_block_hash_ratio_policy(our_config.data_block_hash_ratio_policy.clone())
         .expect_point_read_hits(our_config.expect_point_read_hits)
-        .memtable_filter(our_config.memtable_filter)
+        // **Sized here, because the budget lives here.** `max_memtable_size` is this
+        // crate's rotation threshold; `lsm-tree` never sees it, so a filter built there
+        // would have to guess at the very number this call already holds.
+        .memtable_filter(
+            our_config
+                .memtable_filter
+                .then(|| usize::try_from(our_config.max_memtable_size).unwrap_or(usize::MAX)),
+        )
         .with_kv_separation(our_config.kv_separation_opts.clone())
         .index_block_partitioning_policy(our_config.index_block_partitioning_policy.clone())
         .filter_block_partitioning_policy(our_config.filter_block_partitioning_policy.clone())
