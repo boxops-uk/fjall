@@ -528,6 +528,13 @@ impl Database {
                 opts = opts.with_compaction_filter_factory(f);
             }
 
+            // The database-wide answer wins over the create options', so that one caller
+            // does not have to say the same thing in two places — and so that a keyspace
+            // created now and a keyspace recovered later are configured the same way.
+            if let Some(assigner) = &self.config.memtable_filter_assigner {
+                opts = opts.memtable_filter(assigner(&name));
+            }
+
             let handle = Keyspace::create_new(keyspace_id, self, name.clone(), opts)?;
 
             self.meta_keyspace

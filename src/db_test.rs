@@ -242,3 +242,59 @@ fn recover_sealed_pair_1() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// **The memtable filter survives a reopen, which it could not before.**
+///
+/// It is runtime-only by design and so absent from the stored configuration. That left it
+/// unreachable for a recovered keyspace: `Database::keyspace` does not call its
+/// create-options closure for a keyspace recovery has already produced, so a caller that
+/// asked for the filter at create silently got `false` on every later open — for the life
+/// of the database, with nothing reporting it.
+#[test_log::test]
+fn a_memtable_filter_asked_for_by_the_database_survives_a_reopen() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let wanted = |name: &str| name.starts_with("keys.");
+
+    {
+        let db = Database::builder(&folder)
+            .memtable_filter_for(std::sync::Arc::new(wanted))
+            .open()?;
+
+        let keys = db.keyspace("keys.0", KeyspaceCreateOptions::default)?;
+        let other = db.keyspace("entities.0", KeyspaceCreateOptions::default)?;
+
+        assert!(keys.memtable_filter_enabled(), "asked for at create");
+        assert!(!other.memtable_filter_enabled(), "not asked for");
+
+        keys.insert("a", "a")?;
+    }
+
+    {
+        // The keyspaces exist now, so this open recovers them rather than creating them —
+        // which is the path that used to drop the filter.
+        let db = Database::builder(&folder)
+            .memtable_filter_for(std::sync::Arc::new(wanted))
+            .open()?;
+
+        let keys = db.keyspace("keys.0", KeyspaceCreateOptions::default)?;
+        let other = db.keyspace("entities.0", KeyspaceCreateOptions::default)?;
+
+        assert!(
+            keys.memtable_filter_enabled(),
+            "a recovered keyspace must carry the filter the database asked for"
+        );
+        assert!(!other.memtable_filter_enabled());
+        assert!(keys.contains_key("a")?);
+    }
+
+    // And a database that does not ask gets none, recovered or not — the option is the
+    // opener's choice rather than a property the keyspace remembers.
+    {
+        let db = Database::builder(&folder).open()?;
+        let keys = db.keyspace("keys.0", KeyspaceCreateOptions::default)?;
+
+        assert!(!keys.memtable_filter_enabled());
+    }
+
+    Ok(())
+}

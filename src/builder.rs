@@ -2,7 +2,11 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use crate::{db_config::CompactionFilterAssigner, tx::single_writer::Openable, Config};
+use crate::{
+    db_config::{CompactionFilterAssigner, MemtableFilterAssigner},
+    tx::single_writer::Openable,
+    Config,
+};
 use lsm_tree::{Cache, CompressionType, DescriptorTable};
 use std::{marker::PhantomData, path::Path, sync::Arc};
 
@@ -185,6 +189,36 @@ impl<O: Openable> Builder<O> {
     /// ```
     pub fn with_compaction_filter_factories(mut self, f: CompactionFilterAssigner) -> Self {
         self.inner.compaction_filter_factory_assigner = Some(f);
+        self
+    }
+
+    /// Chooses, by keyspace name, which keyspaces build a Bloom filter over their
+    /// **active memtable** — see [`crate::KeyspaceCreateOptions::memtable_filter`].
+    ///
+    /// **This is the only way to ask for it on a database that already exists.** The
+    /// option is runtime-only by design: it says what this process does with a keyspace,
+    /// not what the keyspace is, so it is not written to the stored configuration. But
+    /// that left it unreachable for any keyspace recovered at open —
+    /// [`Database::keyspace`](crate::Database::keyspace) does not call its create-options
+    /// closure for a keyspace that is already recovered, and recovery rebuilds options
+    /// from what was stored, where this is absent by construction. So a caller that set
+    /// it at create silently lost it on the next open. Set it here and every open gets
+    /// it, recovered keyspaces included.
+    ///
+    /// ```
+    /// # use fjall::Database;
+    /// # use std::sync::Arc;
+    /// # let folder = tempfile::tempdir()?;
+    /// let db = Database::builder(folder)
+    ///     // Point reads on these keyspaces are expected to miss.
+    ///     .memtable_filter_for(Arc::new(|name: &str| name.starts_with("keys.")))
+    ///     .open()?;
+    /// #
+    /// # Ok::<_, fjall::Error>(())
+    /// ```
+    #[must_use]
+    pub fn memtable_filter_for(mut self, f: MemtableFilterAssigner) -> Self {
+        self.inner.memtable_filter_assigner = Some(f);
         self
     }
 }

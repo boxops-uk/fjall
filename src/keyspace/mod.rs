@@ -290,6 +290,19 @@ impl Keyspace {
         self.tree.sealed_memtable_count()
     }
 
+    /// Whether this keyspace builds a Bloom filter over its active memtable.
+    ///
+    /// Exposed because the option is runtime-only and therefore easy to lose without
+    /// anything saying so: it is absent from the stored configuration, so a keyspace
+    /// recovered at open has it only if the database was told
+    /// ([`Builder::memtable_filter_for`](crate::Builder::memtable_filter_for)). A caller
+    /// that depends on it wants to be able to assert it rather than assume it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn memtable_filter_enabled(&self) -> bool {
+        self.config.memtable_filter
+    }
+
     /// Prepare ingestiom of a pre-sorted stream of key-value pairs into the keyspace.
     ///
     /// Prefer this method over singular inserts or write batches/transactions

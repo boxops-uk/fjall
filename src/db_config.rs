@@ -12,6 +12,10 @@ use std::{
 pub type CompactionFilterAssigner =
     Arc<dyn Fn(&str) -> Option<Arc<dyn lsm_tree::compaction::filter::Factory>> + Send + Sync>;
 
+/// Decides, by keyspace name, which keyspaces carry a filter over their **active
+/// memtable** — see [`crate::Builder::memtable_filter_for`].
+pub type MemtableFilterAssigner = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Global database configuration
 #[derive(Clone)]
 pub struct Config {
@@ -48,6 +52,14 @@ pub struct Config {
     // pub(crate) journal_recovery_mode: RecoveryMode,
     //
     pub(crate) compaction_filter_factory_assigner: Option<CompactionFilterAssigner>,
+
+    /// **Asked on every open, because the answer is not stored.** `memtable_filter` is a
+    /// property of what *this process* does with a keyspace rather than of the keyspace,
+    /// so it is deliberately absent from the stored configuration — which means a
+    /// keyspace recovered at open would otherwise have no way to be told, and
+    /// `Database::keyspace`'s create options are not consulted for a keyspace that has
+    /// already been recovered.
+    pub(crate) memtable_filter_assigner: Option<MemtableFilterAssigner>,
 }
 
 const DEFAULT_CPU_CORES: usize = 4;
@@ -90,6 +102,8 @@ impl Config {
             cache: Arc::new(Cache::with_capacity_bytes(/* 32 MiB */ 32 * 1_024 * 1_024)),
 
             compaction_filter_factory_assigner: None,
+
+            memtable_filter_assigner: None,
         }
     }
 }

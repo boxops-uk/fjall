@@ -85,6 +85,15 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
             recovered_config = recovered_config.with_compaction_filter_factory(f);
         }
 
+        // **The one option recovery cannot read off the disk.** `memtable_filter` is
+        // runtime-only by design, so `from_kvs` above always answers `false` for it; a
+        // caller that wants it on a recovered keyspace has nowhere else to say so, since
+        // `Database::keyspace` does not consult create options for a keyspace this loop
+        // has already produced.
+        if let Some(assigner) = &db.config.memtable_filter_assigner {
+            recovered_config = recovered_config.memtable_filter(assigner(&keyspace_name));
+        }
+
         let base_config = lsm_tree::Config::new(
             path,
             db.supervisor.seqno.clone(),
